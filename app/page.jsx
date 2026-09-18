@@ -38,11 +38,50 @@ function saveApiKey(key) {
 async function generateQuestion(sectionId, apiKey) {
   const res = await fetch("/api/generate", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sectionId, apiKey }),
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      sectionId,
+      apiKey,
+    }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+
+  const contentType =
+    res.headers.get("content-type") || "";
+
+  const raw = await res.text();
+
+  let data = null;
+
+  if (contentType.includes("application/json")) {
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      throw new Error(
+        `Server returned malformed JSON (${res.status}).`
+      );
+    }
+  } else {
+    throw new Error(
+      `Server returned a non-JSON response (${res.status}). ` +
+      `This usually means the API route was not deployed correctly.`
+    );
+  }
+
+  if (!res.ok) {
+    throw new Error(
+      data?.error ||
+      `Request failed (${res.status})`
+    );
+  }
+
+  if (!data?.question) {
+    throw new Error(
+      "Server returned no question."
+    );
+  }
+
   return data.question;
 }
 

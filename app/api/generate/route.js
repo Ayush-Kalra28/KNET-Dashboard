@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
 import { SECTIONS, buildPrompt } from "../../../lib/sections";
 
-// Use a current Flash model.
-// Keep this fixed so an outdated GEMINI_MODEL environment variable
-// cannot override it.
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
 const MODEL = "gemini-3.8-flash";
 
 function cleanJsonText(text) {
@@ -30,9 +30,7 @@ function parseModelJson(text) {
     }
 
     try {
-      return JSON.parse(
-        cleaned.slice(start, end + 1)
-      );
+      return JSON.parse(cleaned.slice(start, end + 1));
     } catch {
       return null;
     }
@@ -47,7 +45,6 @@ function validateQuestion(question, section) {
     };
   }
 
-  // Psychometric/profile section
   if (section.kind === "profile") {
     const options = Array.isArray(question.options)
       ? question.options
@@ -78,8 +75,8 @@ function validateQuestion(question, section) {
     }
 
     const uniqueOptions = new Set(
-      options.map((o) =>
-        o.text.trim().toLowerCase()
+      options.map((option) =>
+        option.text.trim().toLowerCase()
       )
     );
 
@@ -197,7 +194,7 @@ function getBlueprint(section) {
 async function callGemini(apiKey, prompt) {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${MODEL}:generateContent?key=${apiKey}`;
+    `${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const payload = {
     contents: [
@@ -210,7 +207,6 @@ async function callGemini(apiKey, prompt) {
         ],
       },
     ],
-
     generationConfig: {
       responseMimeType: "application/json",
     },
@@ -224,20 +220,29 @@ async function callGemini(apiKey, prompt) {
     body: JSON.stringify(payload),
   });
 
-  if (!response.ok) {
-    const errorText = await response
-      .text()
-      .catch(() => "");
+  const responseText = await response.text();
 
+  if (!response.ok) {
     throw new Error(
-      `Gemini API error ${response.status}: ${errorText.slice(
+      `Gemini API error ${response.status}: ${responseText.slice(
         0,
-        700
+        1000
       )}`
     );
   }
 
-  const data = await response.json();
+  let data;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      `Gemini returned a non-JSON response: ${responseText.slice(
+        0,
+        500
+      )}`
+    );
+  }
 
   return (
     data.candidates?.[0]?.content?.parts
@@ -249,102 +254,103 @@ async function callGemini(apiKey, prompt) {
 function buildGenerationPrompt(section, blueprint) {
   return `
 You are an expert aptitude-test item writer creating
-original KNET-style practice questions.
+an original KNET-style practice question.
 
-SECTION
+SECTION:
 ${section.label}
 
-BLUEPRINT
+BLUEPRINT:
 ${JSON.stringify(blueprint)}
 
 ${buildPrompt(section, blueprint)}
 
-IMPORTANT QUALITY RULES
+QUALITY REQUIREMENTS:
 
 1. Create exactly ONE original question.
 2. There must be exactly one defensible answer.
-3. Do not require outside factual knowledge.
-4. Everything needed to solve the question must be supplied.
-5. Test comprehension and reasoning, not difficult vocabulary.
-6. The answer must NOT be obtainable by simple keyword matching.
-7. Do not simply repeat wording from the passage in the question.
+3. Everything needed to solve the question must be supplied.
+4. Do not require outside factual knowledge.
+5. Test reasoning and comprehension rather than difficult vocabulary.
+6. The answer must not be obtainable through simple keyword matching.
+7. Do not directly repeat a phrase from the passage as the answer.
 8. Use multiple relevant pieces of information where appropriate.
 9. Wrong options must be plausible.
-10. Each distractor should correspond to a realistic reasoning mistake.
-11. Do not make a question harder merely by making the passage longer.
-12. Keep the language natural and suitable for a timed aptitude test.
-13. Avoid ambiguity and trick wording.
+10. At least two distractors must represent realistic reasoning mistakes.
+11. Do not make the question difficult merely by making it longer.
+12. Avoid ambiguity.
+13. Keep the question appropriate for a timed aptitude assessment.
 14. Follow the requested difficulty and reasoning depth.
-15. Recheck your own answer before returning the JSON.
-
-For scored questions use:
-
-{
-  "question": "...",
-  "options": ["...", "...", "...", "..."],
-  "correctIndex": 0,
-  "explanation": "...",
-  "difficulty": 7,
-  "questionType": "...",
-  "skill": "...",
-  "reasoningDepth": 3
-}
-
-For profile/psychometric sections use the format
-required by the section instead.
+15. Check the answer yourself before returning it.
 
 Return ONLY valid JSON.
+
+For scored sections:
+
+{
+  "topic": "...",
+  "question": "...",
+  "options": [
+    "...",
+    "...",
+    "...",
+    "..."
+  ],
+  "correctIndex": 0,
+  "explanation": "...",
+  "patternNote": "...",
+  "questionType": "...",
+  "difficulty": 7,
+  "reasoningDepth": 3,
+  "skill": "..."
+}
+
+For profile sections, use the format specified by
+the section instructions.
 `;
 }
 
 export async function POST(req) {
-  let body;
-
   try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      {
-        error: "Invalid request body",
-      },
-      {
-        status: 400,
-      }
+    let body;
+
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json(
+        {
+          error: "Invalid request body",
+        },
+        { status: 400 }
+      );
+    }
+
+    const section = SECTIONS.find(
+      (item) => item.id === body.sectionId
     );
-  }
 
-  const section = SECTIONS.find(
-    (item) => item.id === body.sectionId
-  );
+    if (!section) {
+      return NextResponse.json(
+        {
+          error: "Unknown section",
+        },
+        { status: 400 }
+      );
+    }
 
-  if (!section) {
-    return NextResponse.json(
-      {
-        error: "Unknown section",
-      },
-      {
-        status: 400,
-      }
-    );
-  }
+    const apiKey =
+      body.apiKey ||
+      process.env.GEMINI_API_KEY;
 
-  const apiKey =
-    body.apiKey ||
-    process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        {
+          error:
+            "No Gemini API key found. Add your Gemini API key in Settings.",
+        },
+        { status: 400 }
+      );
+    }
 
-  if (!apiKey) {
-    return NextResponse.json(
-      {
-        error:
-          "No Gemini API key found. Add one in Settings or configure GEMINI_API_KEY in Netlify.",
-      },
-      {
-        status: 400,
-      }
-    );
-  }
-
-  try {
     const blueprint =
       getBlueprint(section);
 
@@ -354,7 +360,6 @@ export async function POST(req) {
         blueprint
       );
 
-    // ONE Gemini request per question.
     const rawResponse =
       await callGemini(
         apiKey,
@@ -363,6 +368,16 @@ export async function POST(req) {
 
     const question =
       parseModelJson(rawResponse);
+
+    if (!question) {
+      return NextResponse.json(
+        {
+          error:
+            "Gemini returned invalid JSON.",
+        },
+        { status: 502 }
+      );
+    }
 
     const validation =
       validateQuestion(
@@ -374,35 +389,42 @@ export async function POST(req) {
       return NextResponse.json(
         {
           error:
-            "Gemini returned an invalid question: " +
+            "Generated question failed validation: " +
             validation.issues.join("; "),
         },
-        {
-          status: 502,
-        }
+        { status: 502 }
       );
     }
 
-    return NextResponse.json({
-      question,
-    });
+    return NextResponse.json(
+      {
+        question,
+      },
+      {
+        status: 200,
+        headers: {
+          "Cache-Control":
+            "no-store, max-age=0",
+        },
+      }
+    );
   } catch (error) {
     const message =
       error?.message ||
       "Unexpected server error";
 
+    const status =
+      message.includes("Gemini API error 429")
+        ? 429
+        : message.includes("Gemini API error 4")
+          ? 400
+          : 500;
+
     return NextResponse.json(
       {
         error: message,
       },
-      {
-        status:
-          message.includes(
-            "Gemini API error 429"
-          )
-            ? 429
-            : 500,
-      }
+      { status }
     );
   }
 }
