@@ -35,7 +35,11 @@ function saveApiKey(key) {
   }
 }
 
-async function generateQuestion(sectionId, apiKey) {
+async function generateQuestion(
+  sectionId,
+  apiKey,
+  onProgress
+) {
   const res = await fetch("/api/generate", {
     method: "POST",
     headers: {
@@ -47,42 +51,114 @@ async function generateQuestion(sectionId, apiKey) {
     }),
   });
 
-  const contentType =
-    res.headers.get("content-type") || "";
+  if (!res.ok) {
+    const raw = await res.text();
 
-  const raw = await res.text();
+    let message = `Request failed (${res.status})`;
 
-  let data = null;
-
-  if (contentType.includes("application/json")) {
     try {
-      data = JSON.parse(raw);
+      const data = JSON.parse(raw);
+      message =
+        data?.error || message;
     } catch {
+      // Response was not JSON.
+    }
+
+    throw new Error(message);
+  }
+
+  if (!res.body) {
+    throw new Error(
+      "The server did not provide a streaming response."
+    );
+  }
+
+  const reader =
+    res.body.getReader();
+
+  const decoder =
+    new TextDecoder();
+
+  let buffer = "";
+  let completedQuestion = null;
+
+  const processLine = (rawLine) => {
+    const line = rawLine.trim();
+
+    if (!line) return;
+
+    let event;
+
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+
+    if (event.type === "status") {
+      onProgress?.(event.message);
+      return;
+    }
+
+    if (event.type === "chunk") {
+      onProgress?.("Writing question...");
+      return;
+    }
+
+    if (event.type === "complete") {
+      completedQuestion =
+        event.question;
+
+      onProgress?.(
+        "Question ready."
+      );
+
+      return;
+    }
+
+    if (event.type === "error") {
       throw new Error(
-        `Server returned malformed JSON (${res.status}).`
+        event.error ||
+          "Question generation failed."
       );
     }
-  } else {
+  };
+
+  while (true) {
+    const { value, done } =
+      await reader.read();
+
+    if (done) break;
+
+    buffer += decoder.decode(
+      value,
+      { stream: true }
+    );
+
+    const lines =
+      buffer.split("\n");
+
+    buffer =
+      lines.pop() || "";
+
+    for (const line of lines) {
+      processLine(line);
+    }
+  }
+
+  buffer += decoder.decode();
+
+  if (buffer.trim()) {
+    processLine(buffer);
+  }
+
+  if (!completedQuestion) {
     throw new Error(
-      `Server returned a non-JSON response (${res.status}). ` +
-      `This usually means the API route was not deployed correctly.`
+      "The server finished streaming without returning a question."
     );
   }
 
-  if (!res.ok) {
-    throw new Error(
-      data?.error ||
-      `Request failed (${res.status})`
-    );
-  }
-
-  if (!data?.question) {
-    throw new Error(
-      "Server returned no question."
-    );
-  }
-
-  return data.question;
+  return completedQuestion;
 }
 
 /* ---------- Dial (signature element) ---------- */
@@ -285,6 +361,7 @@ export default function Page() {
   const [current, setCurrent] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [progressMessage, setProgressMessage] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [questionStartedAt, setQuestionStartedAt] = useState(null);
   const [keyDraft, setKeyDraft] = useState("");
@@ -306,24 +383,58 @@ export default function Page() {
   const activeHistory = histories[activeId] || [];
   const activeCurrent = current[activeId];
 
-  const handleGenerate = useCallback(async () => {
-    if (!apiKey) {
-      setShowSettings(true);
-      setError("Add your Gemini API key in Settings first.");
-      return;
-    }
-    setLoading(true);
-    setError("");
-    try {
-      const q = await generateQuestion(activeId, apiKey);
-      setCurrent((c) => ({ ...c, [activeId]: { question: q, answered: false, chosenIndex: null } }));
-      setQuestionStartedAt(Date.now());
-    } catch (e) {
-      setError(e.message || "Something went wrong");
-    } finally {
-      setLoading(false);
-    }
-  }, [activeId, apiKey]);
+    const handleGenerate = useCallback(
+    async () => {
+      if (!apiKey) {
+        setShowSettings(true);
+        setError(
+          "Add your Gemini API key in Settings first."
+        );
+        return;
+      }
+
+      setLoading(true);
+      setError("");
+      setProgressMessage(
+        "Starting question generation..."
+      );
+
+      try {
+        const q = await generateQuestion(
+          activeId,
+          apiKey,
+          (message) => {
+            setProgressMessage(message);
+          }
+        );
+
+        setCurrent((c) => ({
+          ...c,
+          [activeId]: {
+            question: q,
+            answered: false,
+            chosenIndex: null,
+          },
+        }));
+
+        setQuestionStartedAt(
+          Date.now()
+        );
+
+        setProgressMessage("");
+      } catch (e) {
+        setError(
+          e?.message ||
+            "Something went wrong"
+        );
+
+        setProgressMessage("");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [activeId, apiKey]
+  );
 
   const handleAnswer = useCallback(
     (i) => {
@@ -441,10 +552,14 @@ export default function Page() {
               }}
             >
               {loading ? (
-                <>
-                  <RefreshCw size={13} className="knet-spin" /> Researching…
-                </>
-              ) : (
+  <>
+   <RefreshCw
+      size={13}
+      className="knet-spin"
+    />
+    {progressMessage || "Generating…"}
+  </>
+) : (
                 <>
                   <Zap size={13} /> {activeCurrent ? "New question" : "Generate"}
                 </>
@@ -474,16 +589,40 @@ export default function Page() {
 
           {!activeCurrent && !loading && (
             <div style={{ textAlign: "center", padding: "36px 12px", color: "#9BA0AA", fontSize: 13.5 }}>
-              No question loaded yet. Gemini will research broad assessment patterns, generate a question blueprint,
-              then validate the item before showing it to you.
+              No question loaded yet. Gemini will generate
+              an original question from a controlled
+              assessment blueprint and validate its
+              structure before showing it to you.
             </div>
           )}
 
           {loading && (
-            <div style={{ textAlign: "center", padding: "36px 12px", color: "#767B87", fontSize: 13.5 }}>
-              Researching patterns, drafting, and quality-checking the question…
-            </div>
-          )}
+  <div
+    style={{
+      textAlign: "center",
+      padding: "36px 12px",
+      color: "#767B87",
+      fontSize: 13.5,
+    }}
+  >
+    <div
+      style={{
+        fontWeight: 600,
+        color: "#1B1E24",
+        marginBottom: 6,
+      }}
+    >
+      {progressMessage ||
+        "Generating question…"}
+    </div>
+
+    <div>
+      Gemini is generating the question
+      progressively. The completed question
+      will appear once generation finishes.
+    </div>
+  </div>
+)}
 
           {activeCurrent && !loading && active.kind === "scored" && (
             <ScoredCard q={activeCurrent.question} answered={activeCurrent.answered} chosenIndex={activeCurrent.chosenIndex} onAnswer={handleAnswer} />
