@@ -1,16 +1,18 @@
 import { NextResponse } from "next/server";
 import { SECTIONS, buildPrompt } from "../../../lib/sections";
 
-// Force the currently supported model.
-// Do not use an environment override here, so an old
-// GEMINI_MODEL setting on Netlify cannot break the app.
-const MODEL = "gemini-3.6-flash";
-
-const MAX_GENERATION_ATTEMPTS = 3;
+// Use a current Flash model.
+// Keep this fixed so an outdated GEMINI_MODEL environment variable
+// cannot override it.
+const MODEL = "gemini-3.8-flash";
 
 function cleanJsonText(text) {
   const cleaned = String(text || "").trim();
-  const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+
+  const fenced = cleaned.match(
+    /```(?:json)?\s*([\s\S]*?)\s*```/i
+  );
+
   return fenced ? fenced[1].trim() : cleaned;
 }
 
@@ -28,7 +30,9 @@ function parseModelJson(text) {
     }
 
     try {
-      return JSON.parse(cleaned.slice(start, end + 1));
+      return JSON.parse(
+        cleaned.slice(start, end + 1)
+      );
     } catch {
       return null;
     }
@@ -43,8 +47,7 @@ function validateQuestion(question, section) {
     };
   }
 
-  // Psychometric/profile questions intentionally do not
-  // have a single correct answer.
+  // Psychometric/profile section
   if (section.kind === "profile") {
     const options = Array.isArray(question.options)
       ? question.options
@@ -60,27 +63,27 @@ function validateQuestion(question, section) {
     }
 
     if (options.length !== 4) {
-      issues.push("Must have exactly four options");
+      issues.push("Must contain exactly four options");
     }
 
-    if (
-      options.some(
-        (o) =>
-          !o ||
-          typeof o.text !== "string" ||
-          typeof o.trait !== "string"
+    for (const option of options) {
+      if (
+        !option ||
+        typeof option.text !== "string" ||
+        typeof option.trait !== "string"
+      ) {
+        issues.push("Invalid profile option format");
+        break;
+      }
+    }
+
+    const uniqueOptions = new Set(
+      options.map((o) =>
+        o.text.trim().toLowerCase()
       )
-    ) {
-      issues.push("Invalid profile option shape");
-    }
+    );
 
-    if (
-      new Set(
-        options.map((o) =>
-          o.text?.trim().toLowerCase()
-        )
-      ).size !== options.length
-    ) {
+    if (uniqueOptions.size !== options.length) {
       issues.push("Duplicate options");
     }
 
@@ -111,22 +114,26 @@ function validateQuestion(question, section) {
   }
 
   if (options.length !== 4) {
-    issues.push("Must have exactly four options");
+    issues.push("Must contain exactly four options");
   }
 
   if (
     options.some(
-      (o) => typeof o !== "string" || !o.trim()
+      (option) =>
+        typeof option !== "string" ||
+        !option.trim()
     )
   ) {
     issues.push("Invalid option");
   }
 
-  if (
-    new Set(
-      options.map((o) => o.trim().toLowerCase())
-    ).size !== options.length
-  ) {
+  const uniqueOptions = new Set(
+    options.map((option) =>
+      option.trim().toLowerCase()
+    )
+  );
+
+  if (uniqueOptions.size !== options.length) {
     issues.push("Duplicate options");
   }
 
@@ -151,11 +158,43 @@ function validateQuestion(question, section) {
   };
 }
 
-async function callGemini(
-  apiKey,
-  prompt,
-  useSearch = false
-) {
+function getBlueprint(section) {
+  const questionTypes =
+    section.questionTypes || ["rule_application"];
+
+  const skills =
+    section.skills || ["reasoning"];
+
+  const questionType =
+    questionTypes[
+      Math.floor(Math.random() * questionTypes.length)
+    ];
+
+  const skill =
+    skills[
+      Math.floor(Math.random() * skills.length)
+    ];
+
+  return {
+    questionType,
+    skill,
+    difficulty:
+      section.kind === "profile" ? 6 : 7,
+    reasoningDepth:
+      section.kind === "profile" ? 1 : 3,
+    distractorStrategy:
+      [
+        "partial-rule application",
+        "single-rule shortcut",
+        "misreading a condition",
+        "reversing a relationship",
+      ][
+        Math.floor(Math.random() * 4)
+      ],
+  };
+}
+
+async function callGemini(apiKey, prompt) {
   const url =
     `https://generativelanguage.googleapis.com/v1beta/models/` +
     `${MODEL}:generateContent?key=${apiKey}`;
@@ -164,23 +203,20 @@ async function callGemini(
     contents: [
       {
         role: "user",
-        parts: [{ text: prompt }],
+        parts: [
+          {
+            text: prompt,
+          },
+        ],
       },
     ],
+
     generationConfig: {
       responseMimeType: "application/json",
     },
   };
 
-  if (useSearch) {
-    payload.tools = [
-      {
-        google_search: {},
-      },
-    ];
-  }
-
-  const res = await fetch(url, {
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -188,179 +224,77 @@ async function callGemini(
     body: JSON.stringify(payload),
   });
 
-  if (!res.ok) {
-    const errText = await res
+  if (!response.ok) {
+    const errorText = await response
       .text()
       .catch(() => "");
 
     throw new Error(
-      `Gemini API error ${res.status}: ${errText.slice(
+      `Gemini API error ${response.status}: ${errorText.slice(
         0,
-        500
+        700
       )}`
     );
   }
 
-  const data = await res.json();
+  const data = await response.json();
 
   return (
     data.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text || "")
+      ?.map((part) => part.text || "")
       .join("\n") || ""
   );
 }
 
-function makeBlueprint(section, attempt) {
-  const difficulty =
-    section.kind === "profile"
-      ? 6
-      : Math.min(8, 7 + (attempt % 2));
+function buildGenerationPrompt(section, blueprint) {
+  return `
+You are an expert aptitude-test item writer creating
+original KNET-style practice questions.
 
-  const type =
-    section.questionTypes[
-      attempt % section.questionTypes.length
-    ];
-
-  const skill =
-    section.skills[
-      attempt % section.skills.length
-    ];
-
-  const reasoningDepth =
-    section.kind === "profile"
-      ? 1
-      : 3 + (attempt % 2);
-
-  const distractorStrategies = [
-    "one-step shortcut, one partial-rule application, one reversal of a relationship",
-
-    "correct use of one rule but failure to combine it with the second rule, plus two plausible inference errors",
-
-    "confusion between necessary and sufficient conditions, overlooking an exception, and using an irrelevant fact",
-  ];
-
-  return {
-    questionType: type,
-    difficulty,
-    reasoningDepth,
-    skill,
-    distractorStrategy:
-      distractorStrategies[
-        attempt % distractorStrategies.length
-      ],
-  };
-}
-
-async function validateWithModel(
-  apiKey,
-  question,
-  section,
-  blueprint
-) {
-  const prompt = `
-You are a ruthless quality auditor for a KNET-style aptitude question.
-
-Audit the following generated item against the blueprint and return JSON only.
+SECTION
+${section.label}
 
 BLUEPRINT
 ${JSON.stringify(blueprint)}
 
-ITEM
-${JSON.stringify(question)}
+${buildPrompt(section, blueprint)}
 
-CHECK ALL OF THESE:
+IMPORTANT QUALITY RULES
 
-1. Exactly one defensible answer for scored questions.
-2. All required information is present in the item itself.
-3. The answer requires genuine comprehension/reasoning rather than keyword matching.
-4. The target difficulty is plausible for the requested level.
-5. The requested reasoning depth is actually present.
-6. Distractors are plausible and correspond to realistic reasoning mistakes.
-7. No ambiguity, contradiction, accidental alternate answer, or missing condition.
-8. The explanation supports the keyed answer.
-9. The item is concise and natural for a timed aptitude test.
-10. It is original in wording and scenario.
+1. Create exactly ONE original question.
+2. There must be exactly one defensible answer.
+3. Do not require outside factual knowledge.
+4. Everything needed to solve the question must be supplied.
+5. Test comprehension and reasoning, not difficult vocabulary.
+6. The answer must NOT be obtainable by simple keyword matching.
+7. Do not simply repeat wording from the passage in the question.
+8. Use multiple relevant pieces of information where appropriate.
+9. Wrong options must be plausible.
+10. Each distractor should correspond to a realistic reasoning mistake.
+11. Do not make a question harder merely by making the passage longer.
+12. Keep the language natural and suitable for a timed aptitude test.
+13. Avoid ambiguity and trick wording.
+14. Follow the requested difficulty and reasoning depth.
+15. Recheck your own answer before returning the JSON.
 
-For psychometric items, do not demand a single correct answer.
-Instead verify that all four actions are plausible and meaningfully distinct.
-
-Return exactly:
+For scored questions use:
 
 {
-  "valid": true,
-  "issues": [],
+  "question": "...",
+  "options": ["...", "...", "...", "..."],
+  "correctIndex": 0,
+  "explanation": "...",
   "difficulty": 7,
-  "reasoningDepth": 3,
-  "keywordSolvable": false,
-  "ambiguity": 0,
-  "distractorQuality": 8,
-  "needsRevision": false
-}
-`;
-
-  const text = await callGemini(
-    apiKey,
-    prompt,
-    false
-  );
-
-  const audit = parseModelJson(text);
-
-  if (!audit) {
-    return {
-      valid: false,
-      issues: [
-        "Validator returned invalid JSON",
-      ],
-    };
-  }
-
-  return audit;
+  "questionType": "...",
+  "skill": "...",
+  "reasoningDepth": 3
 }
 
-async function reviseQuestion(
-  apiKey,
-  question,
-  audit,
-  section,
-  blueprint
-) {
-  const prompt = `
-Revise this KNET-style aptitude item so it passes the quality audit.
-
-SECTION:
-${section.label}
-
-BLUEPRINT:
-${JSON.stringify(blueprint)}
-
-CURRENT ITEM:
-${JSON.stringify(question)}
-
-AUDIT:
-${JSON.stringify(audit)}
-
-Fix every listed issue.
-
-Preserve the required output shape.
-
-Do not add unnecessary complexity.
-
-Make the reasoning genuine rather than vocabulary-heavy.
-
-Ensure exactly one defensible answer for scored sections
-and plausible, distinct options.
+For profile/psychometric sections use the format
+required by the section instead.
 
 Return ONLY valid JSON.
 `;
-
-  const text = await callGemini(
-    apiKey,
-    prompt,
-    false
-  );
-
-  return parseModelJson(text);
 }
 
 export async function POST(req) {
@@ -380,7 +314,7 @@ export async function POST(req) {
   }
 
   const section = SECTIONS.find(
-    (s) => s.id === body.sectionId
+    (item) => item.id === body.sectionId
   );
 
   if (!section) {
@@ -402,7 +336,7 @@ export async function POST(req) {
     return NextResponse.json(
       {
         error:
-          "No Gemini API key found. Add one in the Settings panel, or set GEMINI_API_KEY on the server.",
+          "No Gemini API key found. Add one in Settings or configure GEMINI_API_KEY in Netlify.",
       },
       {
         status: 400,
@@ -411,136 +345,63 @@ export async function POST(req) {
   }
 
   try {
-    let lastIssues = [];
+    const blueprint =
+      getBlueprint(section);
 
-    for (
-      let attempt = 0;
-      attempt < MAX_GENERATION_ATTEMPTS;
-      attempt += 1
-    ) {
-      const blueprint = makeBlueprint(
+    const prompt =
+      buildGenerationPrompt(
         section,
-        attempt
+        blueprint
       );
 
-      const researchInstruction = `
-Use Google Search only to understand broad question style
-and assessment patterns for ${section.label}.
-
-Do not copy any source question or wording.
-`;
-
-      const generationPrompt = `
-${researchInstruction}
-
-${buildPrompt(section, blueprint)}
-
-Output raw JSON only.
-`;
-
-      const text = await callGemini(
+    // ONE Gemini request per question.
+    const rawResponse =
+      await callGemini(
         apiKey,
-        generationPrompt,
-        true
+        prompt
       );
 
-      let question = parseModelJson(text);
+    const question =
+      parseModelJson(rawResponse);
 
-      let structural = validateQuestion(
+    const validation =
+      validateQuestion(
         question,
         section
       );
 
-      if (!structural.valid) {
-        lastIssues = structural.issues;
-        continue;
-      }
-
-      let audit = await validateWithModel(
-        apiKey,
-        question,
-        section,
-        blueprint
+    if (!validation.valid) {
+      return NextResponse.json(
+        {
+          error:
+            "Gemini returned an invalid question: " +
+            validation.issues.join("; "),
+        },
+        {
+          status: 502,
+        }
       );
-
-      if (
-        audit.valid &&
-        !audit.needsRevision &&
-        audit.keywordSolvable === false &&
-        Number(audit.ambiguity || 0) <= 2
-      ) {
-        return NextResponse.json({
-          question,
-        });
-      }
-
-      lastIssues =
-        audit.issues || [
-          "Question did not pass quality audit",
-        ];
-
-      question = await reviseQuestion(
-        apiKey,
-        question,
-        audit,
-        section,
-        blueprint
-      );
-
-      structural = validateQuestion(
-        question,
-        section
-      );
-
-      if (!structural.valid) {
-        lastIssues = structural.issues;
-        continue;
-      }
-
-      audit = await validateWithModel(
-        apiKey,
-        question,
-        section,
-        blueprint
-      );
-
-      if (
-        audit.valid &&
-        !audit.needsRevision &&
-        audit.keywordSolvable === false &&
-        Number(audit.ambiguity || 0) <= 2
-      ) {
-        return NextResponse.json({
-          question,
-        });
-      }
-
-      lastIssues =
-        audit.issues || [
-          "Revised question did not pass quality audit",
-        ];
     }
 
+    return NextResponse.json({
+      question,
+    });
+  } catch (error) {
+    const message =
+      error?.message ||
+      "Unexpected server error";
+
     return NextResponse.json(
       {
-        error:
-          `Could not produce a sufficiently reliable question ` +
-          `after ${MAX_GENERATION_ATTEMPTS} attempts. ` +
-          `${lastIssues.join("; ")}`,
+        error: message,
       },
       {
-        status: 502,
-      }
-    );
-  } catch (e) {
-    return NextResponse.json(
-      {
-        error:
-          e.message ||
-          "Unexpected server error",
-      },
-      {
-        status: 500,
+        status:
+          message.includes(
+            "Gemini API error 429"
+          )
+            ? 429
+            : 500,
       }
     );
   }
