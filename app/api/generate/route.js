@@ -5,7 +5,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MODEL = "gemini-3.8-flash";
-const GEMINI_TIMEOUT_MS = 20000;
+
+// Keep this below Netlify's function execution window while
+// allowing Gemini much more time than the previous 20-second cutoff.
+const GEMINI_TIMEOUT_MS = 55_000;
 
 function cleanJsonText(text) {
   const cleaned = String(text || "").trim();
@@ -46,6 +49,7 @@ function validateQuestion(question, section) {
     };
   }
 
+  // Psychometric / profile questions
   if (section.kind === "profile") {
     const options = Array.isArray(question.options)
       ? question.options
@@ -98,6 +102,7 @@ function validateQuestion(question, section) {
     };
   }
 
+  // Scored question validation
   const options = Array.isArray(question.options)
     ? question.options
     : [];
@@ -158,10 +163,14 @@ function validateQuestion(question, section) {
 
 function getBlueprint(section) {
   const questionTypes =
-    section.questionTypes || ["rule_application"];
+    section.questionTypes?.length
+      ? section.questionTypes
+      : ["rule_application"];
 
   const skills =
-    section.skills || ["reasoning"];
+    section.skills?.length
+      ? section.skills
+      : ["reasoning"];
 
   const questionType =
     questionTypes[
@@ -177,123 +186,38 @@ function getBlueprint(section) {
       )
     ];
 
+  const distractorStrategies = [
+    "partial-rule application",
+    "single-rule shortcut",
+    "misreading a condition",
+    "reversing a relationship",
+  ];
+
   return {
     questionType,
     skill,
+
+    // Keep the normal practice target around medium-hard.
     difficulty:
       section.kind === "profile" ? 6 : 7,
+
     reasoningDepth:
       section.kind === "profile" ? 1 : 3,
+
     distractorStrategy:
-      [
-        "partial-rule application",
-        "single-rule shortcut",
-        "misreading a condition",
-        "reversing a relationship",
-      ][
-        Math.floor(Math.random() * 4)
+      distractorStrategies[
+        Math.floor(
+          Math.random() *
+            distractorStrategies.length
+        )
       ],
   };
 }
 
-async function callGemini(apiKey, prompt) {
-  const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, GEMINI_TIMEOUT_MS);
-
-  try {
-    const url =
-      `https://generativelanguage.googleapis.com/v1beta/models/` +
-      `${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-    const payload = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: prompt,
-            },
-          ],
-        },
-      ],
-
-      generationConfig: {
-        responseMimeType: "application/json",
-
-        // Keep generation fast enough for Netlify.
-        maxOutputTokens: 1400,
-
-        // Gemini 3.8 supports low / medium / high.
-        // Low is sufficient for question generation
-        // and substantially reduces latency.
-        thinkingConfig: {
-          thinkingLevel: "low",
-        },
-      },
-    };
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-
-    const responseText = await response.text();
-
-    if (!response.ok) {
-      throw new Error(
-        `Gemini API error ${response.status}: ${responseText.slice(
-          0,
-          1000
-        )}`
-      );
-    }
-
-    let data;
-
-    try {
-      data = JSON.parse(responseText);
-    } catch {
-      throw new Error(
-        `Gemini returned a non-JSON response: ${responseText.slice(
-          0,
-          500
-        )}`
-      );
-    }
-
-    const text =
-      data.candidates?.[0]?.content?.parts
-        ?.map((part) => part.text || "")
-        .join("\n") || "";
-
-    if (!text) {
-      throw new Error(
-        "Gemini returned an empty response."
-      );
-    }
-
-    return text;
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error(
-        "Gemini took too long to respond. The request was stopped before Netlify's timeout."
-      );
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function buildGenerationPrompt(section, blueprint) {
+function buildGenerationPrompt(
+  section,
+  blueprint
+) {
   return `
 You are an expert aptitude-test item writer.
 
@@ -307,24 +231,28 @@ ${JSON.stringify(blueprint)}
 
 ${buildPrompt(section, blueprint)}
 
-IMPORTANT:
+QUALITY REQUIREMENTS
 
-- Create exactly ONE question.
-- Make it self-contained.
-- Exactly one defensible answer for scored sections.
-- Do not require outside knowledge.
-- Test comprehension and reasoning, not vocabulary.
-- Do not make the answer solvable through keyword matching.
-- Do not simply repeat wording from the passage.
-- Use multiple relevant pieces of information when appropriate.
-- Make distractors plausible and based on realistic reasoning mistakes.
-- Do not use ambiguous wording.
-- Do not make difficulty come only from passage length.
-- Keep it suitable for a timed aptitude test.
-- Mentally solve it before returning the answer.
-- Return ONLY valid JSON.
+1. Create exactly ONE original question.
+2. There must be exactly one defensible answer for scored sections.
+3. Everything required to solve the question must be supplied.
+4. Do not require outside factual knowledge.
+5. Test comprehension and reasoning, not difficult vocabulary.
+6. The answer must NOT be obtainable through simple keyword matching.
+7. Do not simply repeat a phrase from the passage in the question.
+8. Use multiple relevant pieces of information where appropriate.
+9. Wrong options must be plausible.
+10. At least two distractors must represent realistic reasoning mistakes.
+11. Do not make difficulty come only from passage length.
+12. Avoid ambiguity and trick wording.
+13. Keep the item suitable for a timed aptitude assessment.
+14. Follow the requested difficulty and reasoning depth.
+15. Make the scenario original.
+16. Mentally solve the question before returning the answer.
+17. Return ONLY valid JSON.
+18. Do NOT use Markdown code fences.
 
-For scored sections return:
+For scored sections return exactly:
 
 {
   "topic": "...",
@@ -344,142 +272,367 @@ For scored sections return:
   "skill": "..."
 }
 
-For profile sections return the exact format
+For profile sections return exactly the format
 specified by the section instructions.
 `;
 }
 
-export async function POST(req) {
+/*
+ * Gemini streaming endpoint
+ *
+ * Gemini sends Server-Sent Events.
+ * We convert those events into newline-delimited JSON
+ * messages that the browser can consume immediately.
+ */
+async function streamGemini(
+  apiKey,
+  prompt,
+  send
+) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, GEMINI_TIMEOUT_MS);
+
   try {
-    let body;
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/` +
+      `${MODEL}:streamGenerateContent?alt=sse`;
 
-    try {
-      body = await req.json();
-    } catch {
-      return NextResponse.json(
+    const payload = {
+      contents: [
         {
-          error: "Invalid request body.",
+          role: "user",
+          parts: [
+            {
+              text: prompt,
+            },
+          ],
         },
-        { status: 400 }
-      );
-    }
+      ],
 
-    const section = SECTIONS.find(
-      (item) => item.id === body.sectionId
-    );
+      generationConfig: {
+        responseMimeType: "application/json",
 
-    if (!section) {
-      return NextResponse.json(
-        {
-          error: "Unknown section.",
+        // Enough room for a complete question,
+        // while preventing unnecessarily huge responses.
+        maxOutputTokens: 1600,
+
+        // Keep reasoning efficient without forcing
+        // the model to rush the actual question writing.
+        thinkingConfig: {
+          thinkingLevel: "low",
         },
-        { status: 400 }
-      );
-    }
-
-    const apiKey =
-      body.apiKey ||
-      process.env.GEMINI_API_KEY;
-
-    if (!apiKey) {
-      return NextResponse.json(
-        {
-          error:
-            "No Gemini API key found. Add your Gemini API key in Settings.",
-        },
-        { status: 400 }
-      );
-    }
-
-    const blueprint =
-      getBlueprint(section);
-
-    const prompt =
-      buildGenerationPrompt(
-        section,
-        blueprint
-      );
-
-    const rawResponse =
-      await callGemini(
-        apiKey,
-        prompt
-      );
-
-    const question =
-      parseModelJson(rawResponse);
-
-    if (!question) {
-      return NextResponse.json(
-        {
-          error:
-            "Gemini returned invalid JSON.",
-        },
-        { status: 502 }
-      );
-    }
-
-    const validation =
-      validateQuestion(
-        question,
-        section
-      );
-
-    if (!validation.valid) {
-      return NextResponse.json(
-        {
-          error:
-            "Generated question failed validation: " +
-            validation.issues.join("; "),
-        },
-        { status: 502 }
-      );
-    }
-
-    return NextResponse.json(
-      {
-        question,
       },
-      {
-        status: 200,
-        headers: {
-          "Cache-Control":
-            "no-store, max-age=0",
-        },
-      }
-    );
-  } catch (error) {
-    const message =
-      error?.message ||
-      "Unexpected server error.";
+    };
 
-    let status = 500;
+    const response = await fetch(url, {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+
+      body: JSON.stringify(payload),
+
+      signal: controller.signal,
+    });
+
+    const contentType =
+      response.headers.get("content-type") || "";
+
+    if (!response.ok) {
+      const errorText = await response
+        .text()
+        .catch(() => "");
+
+      throw new Error(
+        `Gemini API error ${response.status}: ${errorText.slice(
+          0,
+          1200
+        )}`
+      );
+    }
+
+    if (!response.body) {
+      throw new Error(
+        "Gemini did not return a streaming response."
+      );
+    }
 
     if (
-      message.includes(
-        "Gemini API error 429"
-      )
+      !contentType.includes("text/event-stream")
     ) {
-      status = 429;
-    } else if (
-      message.includes(
-        "Gemini API error 4"
-      )
-    ) {
-      status = 400;
-    } else if (
-      message.includes(
-        "took too long"
-      )
-    ) {
-      status = 504;
+      // Gemini should normally return SSE here.
+      // We still attempt to read the body instead of
+      // immediately failing if the provider changes headers.
     }
 
+    const reader =
+      response.body.getReader();
+
+    const decoder =
+      new TextDecoder();
+
+    let lineBuffer = "";
+    let fullText = "";
+
+    const processLine = async (rawLine) => {
+      const line =
+        rawLine.replace(/\r$/, "");
+
+      if (!line.startsWith("data:")) {
+        return;
+      }
+
+      const jsonText =
+        line.slice(5).trim();
+
+      if (
+        !jsonText ||
+        jsonText === "[DONE]"
+      ) {
+        return;
+      }
+
+      let chunk;
+
+      try {
+        chunk = JSON.parse(jsonText);
+      } catch {
+        // Ignore malformed/incomplete SSE lines.
+        return;
+      }
+
+      const textParts =
+        chunk.candidates?.[0]?.content?.parts
+          ?.map(
+            (part) =>
+              typeof part.text === "string"
+                ? part.text
+                : ""
+          )
+          .join("") || "";
+
+      if (!textParts) {
+        return;
+      }
+
+      fullText += textParts;
+
+      // Send every generated piece immediately.
+      await send({
+        type: "chunk",
+        text: textParts,
+      });
+    };
+
+    while (true) {
+      const { value, done } =
+        await reader.read();
+
+      if (done) {
+        break;
+      }
+
+      lineBuffer += decoder.decode(
+        value,
+        { stream: true }
+      );
+
+      const lines =
+        lineBuffer.split("\n");
+
+      lineBuffer =
+        lines.pop() || "";
+
+      for (const line of lines) {
+        await processLine(line);
+      }
+    }
+
+    // Flush decoder.
+    lineBuffer += decoder.decode();
+
+    if (lineBuffer.trim()) {
+      await processLine(lineBuffer);
+    }
+
+    return fullText;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(
+        "Gemini exceeded the 55-second generation window."
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export async function POST(req) {
+  let body;
+
+  try {
+    body = await req.json();
+  } catch {
     return NextResponse.json(
       {
-        error: message,
+        error: "Invalid request body.",
       },
-      { status }
+      { status: 400 }
     );
   }
+
+  const section = SECTIONS.find(
+    (item) =>
+      item.id === body.sectionId
+  );
+
+  if (!section) {
+    return NextResponse.json(
+      {
+        error: "Unknown section.",
+      },
+      { status: 400 }
+    );
+  }
+
+  const apiKey =
+    body.apiKey ||
+    process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    return NextResponse.json(
+      {
+        error:
+          "No Gemini API key found. Add your Gemini API key in Settings.",
+      },
+      { status: 400 }
+    );
+  }
+
+  const encoder =
+    new TextEncoder();
+
+  const stream =
+    new ReadableStream({
+      async start(controller) {
+        const send = async (payload) => {
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify(payload) +
+                "\n"
+            )
+          );
+        };
+
+        try {
+          // Immediately establish the streaming response.
+          await send({
+            type: "status",
+            message:
+              "Starting question generation...",
+          });
+
+          const blueprint =
+            getBlueprint(section);
+
+          await send({
+            type: "status",
+            message:
+              `Building a ${blueprint.difficulty}/10 ${blueprint.questionType.replaceAll(
+                "_",
+                " "
+              )} question...`,
+          });
+
+          const prompt =
+            buildGenerationPrompt(
+              section,
+              blueprint
+            );
+
+          await send({
+            type: "status",
+            message:
+              "Gemini is writing the question...",
+          });
+
+          const rawText =
+            await streamGemini(
+              apiKey,
+              prompt,
+              send
+            );
+
+          await send({
+            type: "status",
+            message:
+              "Checking question structure...",
+          });
+
+          const question =
+            parseModelJson(rawText);
+
+          if (!question) {
+            throw new Error(
+              "Gemini completed generation, but the response was not valid JSON."
+            );
+          }
+
+          const validation =
+            validateQuestion(
+              question,
+              section
+            );
+
+          if (!validation.valid) {
+            throw new Error(
+              "Generated question failed validation: " +
+                validation.issues.join(
+                  "; "
+                )
+            );
+          }
+
+          await send({
+            type: "complete",
+            question,
+          });
+
+          controller.close();
+        } catch (error) {
+          await send({
+            type: "error",
+            error:
+              error?.message ||
+              "Unexpected server error.",
+          });
+
+          controller.close();
+        }
+      },
+    });
+
+  return new Response(stream, {
+    status: 200,
+
+    headers: {
+      "Content-Type":
+        "application/x-ndjson; charset=utf-8",
+
+      "Cache-Control":
+        "no-cache, no-store, must-revalidate",
+
+      "X-Accel-Buffering":
+        "no",
+
+      Connection: "keep-alive",
+    },
+  });
 }
