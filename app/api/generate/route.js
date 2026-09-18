@@ -5,6 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const MODEL = "gemini-3.8-flash";
+const GEMINI_TIMEOUT_MS = 20000;
 
 function cleanJsonText(text) {
   const cleaned = String(text || "").trim();
@@ -164,12 +165,16 @@ function getBlueprint(section) {
 
   const questionType =
     questionTypes[
-      Math.floor(Math.random() * questionTypes.length)
+      Math.floor(
+        Math.random() * questionTypes.length
+      )
     ];
 
   const skill =
     skills[
-      Math.floor(Math.random() * skills.length)
+      Math.floor(
+        Math.random() * skills.length
+      )
     ];
 
   return {
@@ -192,69 +197,107 @@ function getBlueprint(section) {
 }
 
 async function callGemini(apiKey, prompt) {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const controller = new AbortController();
 
-  const payload = {
-    contents: [
-      {
-        role: "user",
-        parts: [
-          {
-            text: prompt,
-          },
-        ],
-      },
-    ],
-    generationConfig: {
-      responseMimeType: "application/json",
-    },
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const responseText = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `Gemini API error ${response.status}: ${responseText.slice(
-        0,
-        1000
-      )}`
-    );
-  }
-
-  let data;
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, GEMINI_TIMEOUT_MS);
 
   try {
-    data = JSON.parse(responseText);
-  } catch {
-    throw new Error(
-      `Gemini returned a non-JSON response: ${responseText.slice(
-        0,
-        500
-      )}`
-    );
-  }
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/` +
+      `${MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
-  return (
-    data.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text || "")
-      .join("\n") || ""
-  );
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: prompt,
+            },
+          ],
+        },
+      ],
+
+      generationConfig: {
+        responseMimeType: "application/json",
+
+        // Keep generation fast enough for Netlify.
+        maxOutputTokens: 1400,
+
+        // Gemini 3.8 supports low / medium / high.
+        // Low is sufficient for question generation
+        // and substantially reduces latency.
+        thinkingConfig: {
+          thinkingLevel: "low",
+        },
+      },
+    };
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    const responseText = await response.text();
+
+    if (!response.ok) {
+      throw new Error(
+        `Gemini API error ${response.status}: ${responseText.slice(
+          0,
+          1000
+        )}`
+      );
+    }
+
+    let data;
+
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error(
+        `Gemini returned a non-JSON response: ${responseText.slice(
+          0,
+          500
+        )}`
+      );
+    }
+
+    const text =
+      data.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text || "")
+        .join("\n") || "";
+
+    if (!text) {
+      throw new Error(
+        "Gemini returned an empty response."
+      );
+    }
+
+    return text;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(
+        "Gemini took too long to respond. The request was stopped before Netlify's timeout."
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function buildGenerationPrompt(section, blueprint) {
   return `
-You are an expert aptitude-test item writer creating
-an original KNET-style practice question.
+You are an expert aptitude-test item writer.
+
+Create ONE original KNET-style practice question.
 
 SECTION:
 ${section.label}
@@ -264,27 +307,24 @@ ${JSON.stringify(blueprint)}
 
 ${buildPrompt(section, blueprint)}
 
-QUALITY REQUIREMENTS:
+IMPORTANT:
 
-1. Create exactly ONE original question.
-2. There must be exactly one defensible answer.
-3. Everything needed to solve the question must be supplied.
-4. Do not require outside factual knowledge.
-5. Test reasoning and comprehension rather than difficult vocabulary.
-6. The answer must not be obtainable through simple keyword matching.
-7. Do not directly repeat a phrase from the passage as the answer.
-8. Use multiple relevant pieces of information where appropriate.
-9. Wrong options must be plausible.
-10. At least two distractors must represent realistic reasoning mistakes.
-11. Do not make the question difficult merely by making it longer.
-12. Avoid ambiguity.
-13. Keep the question appropriate for a timed aptitude assessment.
-14. Follow the requested difficulty and reasoning depth.
-15. Check the answer yourself before returning it.
+- Create exactly ONE question.
+- Make it self-contained.
+- Exactly one defensible answer for scored sections.
+- Do not require outside knowledge.
+- Test comprehension and reasoning, not vocabulary.
+- Do not make the answer solvable through keyword matching.
+- Do not simply repeat wording from the passage.
+- Use multiple relevant pieces of information when appropriate.
+- Make distractors plausible and based on realistic reasoning mistakes.
+- Do not use ambiguous wording.
+- Do not make difficulty come only from passage length.
+- Keep it suitable for a timed aptitude test.
+- Mentally solve it before returning the answer.
+- Return ONLY valid JSON.
 
-Return ONLY valid JSON.
-
-For scored sections:
+For scored sections return:
 
 {
   "topic": "...",
@@ -304,8 +344,8 @@ For scored sections:
   "skill": "..."
 }
 
-For profile sections, use the format specified by
-the section instructions.
+For profile sections return the exact format
+specified by the section instructions.
 `;
 }
 
@@ -318,7 +358,7 @@ export async function POST(req) {
     } catch {
       return NextResponse.json(
         {
-          error: "Invalid request body",
+          error: "Invalid request body.",
         },
         { status: 400 }
       );
@@ -331,7 +371,7 @@ export async function POST(req) {
     if (!section) {
       return NextResponse.json(
         {
-          error: "Unknown section",
+          error: "Unknown section.",
         },
         { status: 400 }
       );
@@ -411,14 +451,29 @@ export async function POST(req) {
   } catch (error) {
     const message =
       error?.message ||
-      "Unexpected server error";
+      "Unexpected server error.";
 
-    const status =
-      message.includes("Gemini API error 429")
-        ? 429
-        : message.includes("Gemini API error 4")
-          ? 400
-          : 500;
+    let status = 500;
+
+    if (
+      message.includes(
+        "Gemini API error 429"
+      )
+    ) {
+      status = 429;
+    } else if (
+      message.includes(
+        "Gemini API error 4"
+      )
+    ) {
+      status = 400;
+    } else if (
+      message.includes(
+        "took too long"
+      )
+    ) {
+      status = 504;
+    }
 
     return NextResponse.json(
       {
